@@ -117,7 +117,7 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
   internal let assetFilesQueue: DispatchQueue
   public internal(set) var isStarted: Bool
 
-  public var state: UpdatesState
+  internal var stateMachine: UpdatesStateMachine
 
   private var loaderTask: AppLoaderTask?
   private var candidateLauncher: AppLauncher?
@@ -156,13 +156,12 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
     self.isEmergencyLaunch = false
     self.logger = UpdatesLogger()
     self.logger.info(message: "AppController sharedInstance created")
-    self.state = UpdatesState()
+    self.stateMachine = UpdatesStateMachine()
 
     super.init()
 
     self.errorRecovery.delegate = self
-    self.state.appController = self
-
+    self.stateMachine.appController = self
   }
 
   /**
@@ -334,6 +333,7 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
   }
 
   public func requestRelaunch(completion: @escaping EXUpdatesAppRelaunchCompletionBlock) {
+    stateMachine.processEvent(UpdatesStateEvent(type: .restart))
     let launcherWithDatabase = AppLauncherWithDatabase(
       config: config,
       database: database,
@@ -349,6 +349,8 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
         RCTReloadCommandSetBundleURL(self.launcher!.launchAssetUrl)
         RCTTriggerReloadCommandListeners("Requested by JavaScript - Updates.reloadAsync()")
         self.runReaper()
+        // Reset the state machine
+        self.stateMachine.reset()
       } else {
         NSLog("Failed to relaunch: %@", error!.localizedDescription)
         completion(false)
@@ -392,17 +394,23 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
   }
 
   public func appLoaderTask(_: AppLoaderTask, didStartCheckingForUpdate _: [String: Any]) {
-    state.handleEvent(AppController.CheckOnLaunch_StartCheckEventName)
+    stateMachine.processEvent(UpdatesStateEvent(type: .check))
   }
 
   public func appLoaderTask(_: AppLoaderTask, didFinishCheckingForUpdate body: [String: Any]) {
-    state.handleEvent(AppController.CheckOnLaunch_CompleteCheckEventName, body: body )
+    let manifest: [String: Any]? = body["manifest"] as? [String: Any]
+    let rollback: Bool? = body["isRollBackToEmbedded"] as? Bool
+    let eventType: UpdatesStateEventType = (rollback == true || manifest != nil) ? .checkCompleteAvailable : .checkCompleteUnavailable
+    stateMachine.processEvent(UpdatesStateEvent(type: eventType, body: body))
+    if eventType == .checkCompleteUnavailable {
+      // Send UpdateEvents to JS
+      sendEventToBridge(AppController.NoUpdateAvailableEventName, body: [:])
+    }
   }
 
-  public func appLoaderTask(_: AppLoaderTask, didStartLoadingUpdate update: Update) {
-    logger.info(message: "AppController appLoaderTask didStartLoadingUpdate", code: .none, updateId: update.loggingId(), assetId: nil)
-    state.handleEvent(AppController.CheckOnLaunch_StartDownloadEventName)
-    remoteLoadStatus = .Loading
+  public func appLoaderTask(_: AppLoaderTask, didStartLoadingUpdate update: Update?) {
+    logger.info(message: "AppController appLoaderTask didStartLoadingUpdate", code: .none, updateId: update?.loggingId(), assetId: nil)
+    stateMachine.processEvent(UpdatesStateEvent(type: .download))
   }
 
   public func appLoaderTask(_: AppLoaderTask, didFinishWithLauncher launcher: AppLauncher, isUpToDate: Bool) {
@@ -436,7 +444,7 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
         "successfulAssetCount": successfulAssetCount,
         "failedAssetCount": failedAssetCount,
         "totalAssetCount": totalAssetCount
-      ]
+      ] as [String: Any]
     ]
     logger.info(
       message: "AppController appLoaderTask didLoadAsset: \(body)",
@@ -444,7 +452,6 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
       updateId: nil,
       assetId: asset.contentHash
     )
-    state.handleEvent(AppController.CheckOnLaunch_AssetDownloadedEventName, body: body)
   }
 
   public func appLoaderTask(_: AppLoaderTask, didFinishWithError error: Error) {
@@ -453,9 +460,9 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
     let body = [
       "message": error.localizedDescription
     ]
-    state.handleEvent(AppController.CheckOnLaunch_ErrorEventName, body: body)
-    // Until state is implemented, we fire the notification below to send UpdateEvents to JS
-    state.handleEvent(AppController.ErrorEventName, body: body)
+    stateMachine.processEvent(UpdatesStateEvent(type: .downloadError, body: body))
+    // Send legacy UpdateEvents to JS
+    sendEventToBridge(AppController.ErrorEventName, body: body)
     emergencyLaunch(fatalError: error as NSError)
   }
 
@@ -480,9 +487,19 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
       let body = [
         "message": error.localizedDescription
       ]
-      state.handleEvent(AppController.CheckOnLaunch_ErrorEventName, body: body)
-      // Until state is implemented, we fire the notification below to send UpdateEvents to JS
-      state.handleEvent(AppController.ErrorEventName, body: body)
+      // Since errors can happen through a number of paths, we do these checks
+      // to make sure the state machine is valid
+      if stateMachine.state == .idle {
+        stateMachine.processEvent(UpdatesStateEvent(type: .download))
+        stateMachine.processEvent(UpdatesStateEvent(type: .downloadError, body: body))
+      } else if stateMachine.state == .checking {
+        stateMachine.processEvent(UpdatesStateEvent(type: .checkError, body: body))
+      } else {
+        // .downloading
+        stateMachine.processEvent(UpdatesStateEvent(type: .downloadError, body: body))
+      }
+      // Send UpdateEvents to JS
+      sendEventToBridge(AppController.ErrorEventName, body: body)
     case .updateAvailable:
       remoteLoadStatus = .NewUpdateLoaded
       guard let update = update else {
@@ -497,9 +514,9 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
       let body = [
         "manifest": update.manifest.rawManifestJSON()
       ]
-      state.handleEvent(AppController.CheckOnLaunch_CompleteDownloadEventName, body: body)
-      // Until state is implemented, we fire the notification below to send UpdateEvents to JS
-      state.handleEvent(AppController.UpdateAvailableEventName, body: body)
+      stateMachine.processEvent(UpdatesStateEvent(type: .downloadComplete, body: body))
+      // Send UpdateEvents to JS
+      sendEventToBridge(AppController.UpdateAvailableEventName, body: body)
     case .noUpdateAvailable:
       remoteLoadStatus = .Idle
       logger.info(
@@ -508,8 +525,12 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
         updateId: update?.loggingId(),
         assetId: nil
       )
-      // Until state is implemented, we fire the notification below to send UpdateEvents to JS
-      state.handleEvent(AppController.NoUpdateAvailableEventName)
+      // TODO: handle rollbacks properly, but this works for now
+      if stateMachine.state == .downloading {
+        stateMachine.processEvent(UpdatesStateEvent(type: .downloadComplete, body: [:]))
+      }
+      // Otherwise, we don't need to call the state machine here, it already transitioned to .checkCompleteUnavailable
+
     }
 
     errorRecovery.notify(newRemoteLoadStatus: remoteLoadStatus)
@@ -562,10 +583,11 @@ public class AppController: NSObject, AppLoaderTaskDelegate, ErrorRecoveryDelega
 
   internal func sendEventToBridge(_ eventType: String, body: [AnyHashable: Any]) {
     guard let bridge = bridge else {
-      NSLog("EXUpdates: Could not emit %@ event. Did you set the bridge property on the controller singleton?", eventType)
+      logger.error(message: "EXUpdates: Could not emit \(eventType) event. Did you set the bridge property on the controller singleton?", code: .jsRuntimeError)
       return
     }
 
+    logger.debug(message: "sendEventToBridge(): type = \(eventType)")
     var mutableBody = body
     mutableBody["type"] = eventType
     bridge.enqueueJSCall("RCTDeviceEventEmitter.emit", args: [AppController.EXUpdatesEventName, mutableBody])
